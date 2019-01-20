@@ -1,0 +1,162 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  ImageId:
+    Type: AWS::EC2::Image::Id
+    Description: EC2 Image Id
+    Default: ami-00a5245b4816c38e6
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet Id
+  Min:
+    Type: Number
+    Description: Instance Min Count
+    Default: 0
+  Max:
+    Type: Number
+    Description: Instance Max Count
+    Default: 0
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Parameters:
+          - ImageId
+          - SubnetId
+          - Min
+          - Max
+
+Resources:
+  LaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceMonitoring: false
+      InstanceType: t2.micro
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: PutDeleteAlarmEventRule
+    Properties:
+      DesiredCapacity: !Ref Min
+      HealthCheckGracePeriod: 60
+      HealthCheckType: EC2
+      LaunchConfigurationName: !Ref LaunchConfiguration
+      MinSize: !Ref Min
+      MaxSize: !Ref Max
+      VPCZoneIdentifier:
+        - !Ref SubnetId
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT0S
+
+  CWEventsExecuteAutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMFullAccess
+        - arn:aws:iam::aws:policy/CloudWatchFullAccess
+
+  PutDeleteAlarmEventRule:
+    Type: AWS::Events::Rule
+    DependsOn: SSMAutomationCPUAlarm
+    Properties:
+      Description: Put and Delete Alarm
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.autoscaling
+        detail-type:
+          - 'EC2 Instance Launch Successful'
+          - 'EC2 Instance Terminate Successful'
+      Targets:
+        - Id: SSMAutomationCPUAlarm
+          Arn: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${SSMAutomationCPUAlarm}'
+          RoleArn: !GetAtt CWEventsExecuteAutomationRole.Arn
+          InputTransformer:
+            InputPathsMap:
+              DetailType: '$.detail-type'
+              EC2InstanceId: '$.detail.EC2InstanceId'
+            InputTemplate: '{ "DetailType":[<DetailType>], "EC2InstanceId":[<EC2InstanceId>] }'
+
+  SSMAutomationCPUAlarm:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      Content:
+        schemaVersion: '0.3'
+        description: Put or Delete Alarm. EC2 High CPU Utilization
+        parameters:
+          DetailType:
+            type: String
+            description: 'EC2 Instance Launch Successful|EC2 Instance Terminate Successful'
+            allowedPattern: 'EC2 Instance Launch Successful|EC2 Instance Terminate Successful'
+          EC2InstanceId:
+            type: String
+            description: EC2 Instance Id
+          AlarmNamePrefix:
+            type: String
+            description: High CPU Alarm Name Prefix
+            default: High CPU Utilization Alarm
+        mainSteps:
+          - name: BranchPutAlarmOrDeleteAlarm
+            action: aws:branch
+            inputs:
+              Choices:
+                - NextStep: PutAlarm
+                  Variable: '{{ DetailType }}'
+                  StringEquals: 'EC2 Instance Launch Successful'
+                - NextStep: DeleteAlarm
+                  Variable: '{{ DetailType }}'
+                  StringEquals: 'EC2 Instance Terminate Successful'
+              Default: DoNothing
+
+          - name: PutAlarm
+            action: aws:executeAwsApi
+            maxAttempts: 1
+            isEnd: true
+            onFailure: Abort
+            inputs:
+              Service: cloudwatch
+              Api: PutMetricAlarm
+              AlarmName: '{{ AlarmNamePrefix }} - {{ EC2InstanceId }}'
+              AlarmDescription: High CPU Utilization
+              ActionsEnabled: true
+              MetricName: CPUUtilization
+              Namespace: AWS/EC2
+              Dimensions:
+                - Name: InstanceId
+                  Value: '{{ EC2InstanceId }}'
+              ComparisonOperator: GreaterThanOrEqualToThreshold
+              Threshold: 60
+              Period: 300
+              DatapointsToAlarm: 1
+              EvaluationPeriods: 1
+              Statistic: Average
+
+          - name: DeleteAlarm
+            action: aws:executeAwsApi
+            maxAttempts: 1
+            isEnd: true
+            onFailure: Abort
+            inputs:
+              Service: cloudwatch
+              Api: DeleteAlarms
+              AlarmNames:
+                - '{{ AlarmNamePrefix }} - {{ EC2InstanceId }}'
+
+          - name: DoNothing
+            action: aws:sleep
+            isEnd: true
+            inputs:
+              Duration: PT1S
