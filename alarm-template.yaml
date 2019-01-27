@@ -37,6 +37,7 @@ Resources:
     Type: AWS::AutoScaling::AutoScalingGroup
     DependsOn: PutDeleteAlarmEventRule
     Properties:
+      AutoScalingGroupName: EC2-A3-AutoScalingGroup
       DesiredCapacity: !Ref Min
       HealthCheckGracePeriod: 60
       HealthCheckType: EC2
@@ -76,6 +77,9 @@ Resources:
       EventPattern:
         source:
           - aws.autoscaling
+        detail:
+          AutoScalingGroupName:
+            - EC2-A3-AutoScalingGroup
         detail-type:
           - 'EC2 Instance Launch Successful'
           - 'EC2 Instance Terminate Successful'
